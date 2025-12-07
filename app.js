@@ -14,8 +14,11 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const SHEET_ID =
   process.env.GOOGLE_SHEET_ID || "1MeCb_ClcxP-H_e6vYid49l-ayRd0cF-TE_StXRO9dnM";
+
+// 💡 修改 1: 交易範圍擴展到 G 欄 (包含 accountName)
 const TRANSACTION_SHEET_RANGE =
-  process.env.GOOGLE_TRANSACTION_RANGE || "'transactions'!A:F";
+  process.env.GOOGLE_TRANSACTION_RANGE || "'transactions'!A:G";
+// 💡 修改 2: 交易欄位新增 accountName
 const TRANSACTION_COLUMNS = [
   "id",
   "date",
@@ -23,8 +26,10 @@ const TRANSACTION_COLUMNS = [
   "category_id",
   "amount",
   "note",
+  "accountName", // 👈 新增
 ];
 const REQUIRED_TRANSACTION_COLUMNS = ["id", "date", "type", "amount"];
+
 const CATEGORY_SHEET_RANGE =
   process.env.GOOGLE_CATEGORY_RANGE || "'categories'!A:C";
 const CATEGORY_COLUMNS = ["id", "name", "color_hex"];
@@ -40,8 +45,14 @@ const DEFAULT_BUDGET = {
   amount: "0",
 };
 const HEX_COLOR_REGEX = /^#([0-9a-fA-F]{6})$/;
-const ADMIN_USERNAME = process.env.ADMIN_USERNAME || "gonsakon";
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "!Nba1q2w3e4r";
+
+// 💡 新增 3: 使用者相關常數
+const USER_SHEET_RANGE = process.env.GOOGLE_USER_RANGE || "'accountName'!A:C";
+const USER_COLUMNS = ["id", "username", "password"];
+// 移除原有的單一 ADMIN 帳號密碼
+// const ADMIN_USERNAME = process.env.ADMIN_USERNAME || "gonsakon";
+// const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "!Nba1q2w3e4r";
+
 const JWT_SECRET = process.env.JWT_SECRET || "change-me-secret";
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "365d";
 const API_ENDPOINTS = [
@@ -100,13 +111,13 @@ const getSheetsClient = (() => {
       ...(credentials
         ? { credentials }
         : {
-            keyFile:
-              process.env.GOOGLE_APPLICATION_CREDENTIALS ||
-              path.join(
-                __dirname,
-                "sunlit-adviser-479406-r0-b5a712496697.json"
-              ),
-          }),
+          keyFile:
+            process.env.GOOGLE_APPLICATION_CREDENTIALS ||
+            path.join(
+              __dirname,
+              "sunlit-adviser-479406-r0-b5a712496697.json"
+            ),
+        }),
       scopes: ["https://www.googleapis.com/auth/spreadsheets"],
     });
 
@@ -149,8 +160,9 @@ const appendRow = async (sheets, range, columns, payload) => {
 /**
  * 找出指定 id 在工作表中的列索引（0-based，不含標題列）
  * 回傳 { rowIndex, rowData } 或 null
+ * 💡 調整：新增 extraFilter 參數，用於驗證是否匹配特定欄位值
  */
-const findRowById = async (sheetRange, idColumn, targetId) => {
+const findRowById = async (sheetRange, idColumn, targetId, extraFilter = {}) => {
   const sheets = getSheetsClient();
   const response = await sheets.spreadsheets.values.get({
     spreadsheetId: SHEET_ID,
@@ -167,11 +179,22 @@ const findRowById = async (sheetRange, idColumn, targetId) => {
   const normalizedTarget = (targetId ?? "").toString().trim();
   for (let i = 0; i < dataRows.length; i++) {
     const rowId = (dataRows[i][idIndex] ?? "").toString().trim();
-    if (rowId === normalizedTarget) {
-      const rowData = header.reduce((acc, key, idx) => {
-        acc[key] = dataRows[i][idx] ?? "";
-        return acc;
-      }, {});
+    if (rowId !== normalizedTarget) {
+      continue;
+    }
+
+    const rowData = header.reduce((acc, key, idx) => {
+      acc[key] = dataRows[i][idx] ?? "";
+      return acc;
+    }, {});
+
+    // 檢查額外的過濾條件
+    const isMatch = Object.keys(extraFilter).every(key => {
+      // 忽略大小寫比對
+      return (rowData[key] || "").toLowerCase() === (extraFilter[key] || "").toLowerCase();
+    });
+
+    if (isMatch) {
       return { rowIndex: i + 2, rowData }; // +2: 1 for 1-based, 1 for header
     }
   }
@@ -377,6 +400,31 @@ const getBudget = async () => {
   return budgets[0];
 };
 
+// 💡 新增 4: 讀取所有使用者資料的函數
+const getUserRows = async () => {
+  const sheets = getSheetsClient();
+  const response = await sheets.spreadsheets.values
+    .get({
+      spreadsheetId: SHEET_ID,
+      range: USER_SHEET_RANGE,
+    })
+    .catch((error) => {
+      if (error.code === 400 || error.code === 404) {
+        // 如果工作表不存在，至少回傳標題列
+        return { data: { values: [USER_COLUMNS] } };
+      }
+      throw error;
+    });
+
+  const rawValues = response.data.values || [];
+  if (rawValues.length < 1) {
+    return [];
+  }
+
+  // 如果只有標題列，normalizeRows 會回傳空陣列
+  return normalizeRows(rawValues);
+};
+
 const generateToken = (payload) =>
   jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
 
@@ -399,24 +447,35 @@ const requireAuth = (req, res, next) => {
 
 app.get("/", (req, res) => {
   res.json({
-    message: "Google Sheets 商品 API",
+    message: "Google Sheets wallet API",
     sheetId: SHEET_ID,
     endpoints: API_ENDPOINTS,
   });
 });
 
-app.post("/auth/login", (req, res) => {
+// 💡 修改 5: 使用 getUserRows 實現多帳號登入
+app.post("/auth/login", async (req, res) => {
   const { username, password } = req.body || {};
+  // console.log(`嘗試登入: ${username}, 密碼: ${password}`); // 檢查輸入是否正確
+  const users = await getUserRows();
+  // console.log('從 Sheets 讀取到的所有使用者:', users); // 檢查是否成功讀取到 user1
+  const user = users.find(
+    // ⚠️ 注意: 實際生產環境中，密碼應使用 bcrypt 等工具雜湊後比對！
+    (u) => u.username === username && u.password === password
+  );
 
-  if (username !== ADMIN_USERNAME || password !== ADMIN_PASSWORD) {
+  if (!user) {
     return res.status(401).json({ message: "帳號或密碼錯誤" });
   }
 
-  const token = generateToken({ username });
+  const token = generateToken({ username: user.username });
   res.json({ token, expiresIn: JWT_EXPIRES_IN });
 });
 
+// 💡 修改 6: 移除 listTransactionsHandler 中的資料過濾邏輯
 const listTransactionsHandler = async (req, res) => {
+  // 不再需要 currentUsername 變數
+
   try {
     const sheets = getSheetsClient();
     const response = await sheets.spreadsheets.values
@@ -431,7 +490,9 @@ const listTransactionsHandler = async (req, res) => {
         throw error;
       });
 
+    // 取得所有交易資料 (包含其他使用者的)
     const transactions = normalizeRows(response.data.values);
+
     const categories = await getCategoryRows();
     const categoryMap = categories.reduce((acc, category) => {
       const id = normalizeCategoryId(category.id);
@@ -465,11 +526,15 @@ const listTransactionsHandler = async (req, res) => {
   }
 };
 
-app.get("/api/transactions", listTransactionsHandler);
-// 向後相容既有的 /api/products route
-app.get("/api/products", listTransactionsHandler);
+// 記得 GET 路由要使用 requireAuth 來確保登入
+app.get("/api/transactions", requireAuth, listTransactionsHandler);
+app.get("/api/products", requireAuth, listTransactionsHandler);
 
+// 💡 保持 7: 保留 createTransactionHandler 中自動寫入 accountName 的功能
 const createTransactionHandler = async (req, res) => {
+  // 從 JWT 取得當前使用者名稱
+  const currentUsername = req.user.username;
+
   try {
     if (!req.body || typeof req.body !== "object") {
       return res.status(400).json({ message: "請提供記帳資料" });
@@ -494,12 +559,13 @@ const createTransactionHandler = async (req, res) => {
     ) ||
       findCategoryByName(categories, requestedCategoryName) ||
       findCategoryById(categories, DEFAULT_CATEGORY.id) || {
-        ...DEFAULT_CATEGORY,
-      };
+      ...DEFAULT_CATEGORY,
+    };
 
     const payload = {
       ...req.body,
       category_id: resolvedCategory.id,
+      accountName: currentUsername, // 👈 新增：強制設定 accountName
     };
     delete payload.category;
 
@@ -525,10 +591,9 @@ const createTransactionHandler = async (req, res) => {
 };
 
 app.post("/api/transactions", requireAuth, createTransactionHandler);
-// 向後相容既有的 /api/products route
 app.post("/api/products", requireAuth, createTransactionHandler);
 
-// PUT /api/transactions/:id - 更新記帳資料
+// 💡 修改 8: PUT /api/transactions/:id 移除 accountName 驗證
 app.put("/api/transactions/:id", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
@@ -536,10 +601,13 @@ app.put("/api/transactions/:id", requireAuth, async (req, res) => {
       return res.status(400).json({ message: "請提供記帳資料" });
     }
 
+    // 移除 accountName 過濾條件，允許更新所有資料
     const found = await findRowById(TRANSACTION_SHEET_RANGE, "id", id);
     if (!found) {
       return res.status(404).json({ message: "找不到該筆記帳資料" });
     }
+
+    // ... (剩下的邏輯不變)
 
     const categories = await getCategoryRows();
     const requestedCategoryId = normalizeCategoryId(req.body.category_id);
@@ -552,14 +620,16 @@ app.put("/api/transactions/:id", requireAuth, async (req, res) => {
       findCategoryByName(categories, requestedCategoryName) ||
       findCategoryById(categories, found.rowData.category_id) ||
       findCategoryById(categories, DEFAULT_CATEGORY.id) || {
-        ...DEFAULT_CATEGORY,
-      };
+      ...DEFAULT_CATEGORY,
+    };
 
     const payload = {
       ...found.rowData,
       ...req.body,
       id, // 確保 id 不被覆蓋
       category_id: resolvedCategory.id,
+      // 保持原有的 accountName 不變，除非 req.body 明確傳入
+      accountName: found.rowData.accountName,
     };
     delete payload.category;
 
@@ -584,11 +654,12 @@ app.put("/api/transactions/:id", requireAuth, async (req, res) => {
   }
 });
 
-// DELETE /api/transactions/:id - 刪除記帳資料
+// 💡 修改 9: DELETE /api/transactions/:id 移除 accountName 驗證
 app.delete("/api/transactions/:id", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
 
+    // 移除 accountName 過濾條件，允許刪除所有資料
     const found = await findRowById(TRANSACTION_SHEET_RANGE, "id", id);
     if (!found) {
       return res.status(404).json({ message: "找不到該筆記帳資料" });
@@ -602,6 +673,8 @@ app.delete("/api/transactions/:id", requireAuth, async (req, res) => {
     res.status(500).json({ message: "無法刪除記帳資料", error: error.message });
   }
 });
+
+// 以下路由保持不變（categories 和 budget）
 
 app.get("/api/categories", async (req, res) => {
   try {
